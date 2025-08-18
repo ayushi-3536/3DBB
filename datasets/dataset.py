@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from utils import corners_to_7d, get_logger
 
 class PointCloudDataset(Dataset):
-    def __init__(self, dataframe, transform=None, pc_transform=None, size=(512, 512)):
+    def __init__(self, dataframe, transform=None, pc_transform=None, size=(504, 504)):
         self.data = dataframe
         self.size = size
     

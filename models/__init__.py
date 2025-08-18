@@ -1,5 +1,4 @@
 from .builder import build_model
-from .dinov2 import Dinov2
-from .pointpiller import PointPillarBEVExtractor
 from .multimodalmodel import MultimodalDetectionNet
-__all__ = ['Dinov2', 'PointPillarBEVExtractor', 'MultimodalDetectionNet', 'build_model']
+from .multimodalmodelv2 import MultimodalDetectionNet_v2
+__all__ = ['MultimodalDetectionNet_v2', 'MultimodalDetectionNet', 'build_model']

@@ -1,0 +1,87 @@
+data:
+  batch_size: 16 
+  pin_memory: true
+  #meta data for each dataset
+  meta:
+    train: '/home/as2114/code/3DBB/data/dl_challenge/train.csv'
+    test: '/home/as2114/code/3DBB/data/dl_challenge/val.csv'
+
+model:
+  type: MultimodalDetectionNet_v2
+  cfg:
+    POINT_PILLARS:
+      VFE:
+        USE_NORM: true
+        NUM_POINT_FEATURES: 3
+        NUM_FILTERS: [64]
+        WITH_DISTANCE: false
+        USE_ABSLOTE_XYZ: true
+      MAP_TO_BEV:
+        NUM_BEV_FEATURES: 64
+      BACKBONE_2D:
+        USE_CONV_FOR_FIRST_MODULE: true
+        LAYER_NUMS: [3, 5, 5]
+        LAYER_STRIDES: [2, 2, 2]
+        NUM_FILTERS: [64, 128, 256]
+        UPSAMPLE_STRIDES: [1, 2, 4]
+        NUM_UPSAMPLE_FILTERS: [128, 128, 128]
+        INPUT_FEATURES: 64
+      POINT_CLOUD_RANGE: [0, -39.68, -3, 69.12, 39.68, 1]
+      VOXEL_SIZE: [0.16, 0.16, 4.0]
+    DINO_FEATURES:
+      MODEL_NAME: "facebook/dinov2-base"
+      FREEZE: true
+      IMAGE_INPUT_SIZE: [504, 504]
+    FUSION:
+      IMAGE_BEV_CHANNELS: 256
+      FUSED_CHANNELS: 512
+    MODEL:
+      NUM_CLASSES: 1
+
+train:
+  start_epoch: 0
+  epochs: 200
+  warmup_epochs: 30
+  weight_decay: 0.00005
+  warmup_lr: 0.00001
+  min_lr: 0.000005
+  
+  clip_grad: 1.0 
+
+  lr_scheduler:
+    name: cosine
+    cycle_limit: 1
+    decay_epochs: 30
+
+  finetune:
+    #If finetune is true, we load the model from the resume path and only train the last layer, freeze 6 layers
+    img_encoder_params_prefix: []
+
+  optimizer:
+    name: adamw
+    eps: 1e-8
+    betas: [0.9, 0.999]
+    base_lr: 0.000005
+
+
+evaluate:
+  eval_freq: 30
+  save_best: true
+
+checkpoint:
+  auto_resume: true
+  resume: ''
+  freq: 10
+  max_kept: -1
+  save_freq: 10
+  
+
+model_name: 'multimodal' # display name in the logger
+output: ???
+wandb_output: ''
+tag: default
+print_freq: 1
+seed: 0
+wandb: true
+local_rank: ???
+vis: []

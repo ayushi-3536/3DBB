@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=0, help='random seed for initialization')
 
     parser.add_argument(
-        '--output', default="/mnt/gsdata/projects/panops/plant_trait_net/outputs_v5/3dbb7_test", type=str, help='root of output folder, '
+        '--output', default="/mnt/gsdata/projects/panops/plant_trait_net/outputs_v5/13dbb_fusednet", type=str, help='root of output folder, '
         'the full path is <output>/<model_name>/<tag>')
     parser.add_argument('--tag', type=str, help='tag of experiment')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
