@@ -1,0 +1,58 @@
+data:
+  batch_size: 16 
+  pin_memory: true
+  #meta data for each dataset
+  meta:
+    train: '/home/as2114/code/3DBB/data/dl_challenge/train.csv'
+    test: '/home/as2114/code/3DBB/data/dl_challenge/val.csv'
+
+model:
+  type: MultimodalDetectionNet
+
+train:
+  start_epoch: 0
+  epochs: 200
+  warmup_epochs: 200
+  weight_decay: 0.00005
+  warmup_lr: 0.00025
+  min_lr: 0.00025
+  
+  clip_grad: 1.0 
+
+  lr_scheduler:
+    name: cosine
+    cycle_limit: 1
+    decay_epochs: 500
+
+  finetune:
+    #If finetune is true, we load the model from the resume path and only train the last layer, freeze 6 layers
+    img_encoder_params_prefix: []
+
+  optimizer:
+    name: adamw
+    eps: 1e-8
+    betas: [0.9, 0.999]
+    base_lr: 0.00025
+
+
+evaluate:
+  #This check would disable loading of optimizer and scheduler if set to true
+  eval_freq: 30
+  save_best: true
+
+checkpoint:
+  auto_resume: true
+  resume: ''
+  max_kept: -1
+  save_freq: 30
+  
+
+model_name: 'multimodal' # display name in the logger
+output: ???
+wandb_output: ''
+tag: default
+print_freq: 1
+seed: 0
+wandb: True
+local_rank: ???
+vis: []
