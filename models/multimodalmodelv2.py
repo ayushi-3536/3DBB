@@ -7,7 +7,6 @@ import numpy as np # For numpy usage in linear_sum_assignment
 from typing import Optional
 
 # --- OpenPCDet Modules (Ensure OpenPCDet is installed and available) ---
-# Assuming these imports work after correctly installing OpenPCDet
 from pcdet.models.backbones_3d.vfe.pillar_vfe import PillarVFE
 from pcdet.models.backbones_2d.map_to_bev.pointpillar_scatter import PointPillarScatter
 from pcdet.models.backbones_2d.base_bev_backbone import BaseBEVBackbone
@@ -198,25 +197,13 @@ class MultimodalDetectionNet_v2(nn.Module):
         self.logger = get_logger()
         self.num_queries = num_queries
         self.num_classes = num_classes 
-
-        # --- RGB Image Branch (ResNet50) ---
-        # Note: ResNet50 is not used here as DINOv2 provides image features.
-        # This 'rgb_backbone' might be a remnant from a previous design.
-        # If you intend to use it, you'd need to adapt how its features are fused.
-        # For current design, DINOv2 is the primary image feature extractor.
-        self.rgb_backbone = nn.Identity() # Placeholder if not used, or remove if truly not needed.
-        # Original: self.rgb_backbone = resnet50(pretrained=True); self.rgb_backbone.avgpool = nn.Identity(); self.rgb_backbone.fc = nn.Identity()
-
         # --- Point Cloud Branch (PointPillarBEVExtractor) ---
         self.pc_extractor = PointPillarBEVExtractor(self.cfg.POINT_PILLARS)
-        # Calculate actual output channels for pc_extractor's BaseBEVBackbone
+        
         # The BaseBEVBackbone's output is a concatenation of upsampled features.
         num_upsample_filters = self.cfg.POINT_PILLARS.BACKBONE_2D.NUM_UPSAMPLE_FILTERS
         pc_bev_output_channels = sum(num_upsample_filters) # This correctly sums up to 384 based on your config
 
-        # --- Determine the final fusion resolution ---
-        # Based on your debug output: PC BEV Features Shape: [4, 384, 248, 216]
-        # This means the target H and W for fusion are 248 (Height) and 216 (Width).
         final_fused_H_bev = 248 
         final_fused_W_bev = 216
 
@@ -330,8 +317,8 @@ class MultimodalDetectionNet_v2(nn.Module):
         # 1. Image Feature Extraction (DINOv2)
         if rgb_image.shape[2] != self.dino_model.dino_input_H or rgb_image.shape[3] != self.dino_model.dino_input_W:
             rgb_image_resized = F.interpolate(rgb_image, 
-                                              size=(self.dino_model.dino_input_H, self.dino_model.dino_input_W), 
-                                              mode='bilinear', align_corners=False)
+                                        size=(self.dino_model.dino_input_H, self.dino_model.dino_input_W), 
+                                        mode='bilinear', align_corners=False)
         else:
             rgb_image_resized = rgb_image
             
@@ -430,9 +417,6 @@ class MultimodalDetectionNet_v2(nn.Module):
             cost_cls = F.cross_entropy(pred_logits_sample.repeat(num_gt, 1, 1).flatten(0,1), 
                                     gt_labels_sample.repeat_interleave(num_preds), reduction='none').view(num_gt, num_preds)
             
-            # This line will now work correctly as both inputs have 6 columns
-            # This line will now work correctly as both inputs have 6 columns
-            print(f"DEBUG: Sample {b} - pred_boxes_sample shape: {pred_boxes_sample.shape}, gt_boxes_sample shape: {gt_boxes_sample.shape}")
             gt_boxes_sample = gt_boxes_sample.to(pred_boxes_sample.device) # Ensure GT boxes are on the same device
             cost_box = torch.cdist(pred_boxes_sample[:, :6], gt_boxes_sample[:, :6], p=1)
             # Transpose cost_box to match (num_gt, num_preds) format for element-wise addition
@@ -541,83 +525,3 @@ class MultimodalDetectionNet_v2(nn.Module):
             results['preds'].append(final_boxes)
 
         return results
-
-# if __name__ == "__main__":
-#     cfg_multimodal = EasyDict({
-#         'POINT_PILLARS': {
-#             'VFE': {
-#                 'USE_NORM': True, 'NUM_POINT_FEATURES': 3, 
-#                 'NUM_FILTERS': [64],
-#                 'WITH_DISTANCE': False, 'USE_ABSLOTE_XYZ': True
-#             },
-#             'MAP_TO_BEV': {
-#                 'NUM_BEV_FEATURES': 64 
-#             },
-#             'BACKBONE_2D': {
-#                 'USE_CONV_FOR_FIRST_MODULE': True, 
-#                 'LAYER_NUMS': [3, 5, 5], 
-#                 'LAYER_STRIDES': [2, 2, 2], 
-#                 'NUM_FILTERS': [64, 128, 256], 
-#                 'UPSAMPLE_STRIDES': [1, 2, 4], 
-#                 'NUM_UPSAMPLE_FILTERS': [128, 128, 128], 
-#                 'INPUT_FEATURES': 64 
-#             },
-#             'POINT_CLOUD_RANGE': [0, -39.68, -3, 69.12, 39.68, 1], 
-#             'VOXEL_SIZE': [0.16, 0.16, 4.0] 
-#         },
-#         'DINO_FEATURES': {
-#             'MODEL_NAME': "facebook/dinov2-base", 
-#             'FREEZE': True, 
-#             'IMAGE_INPUT_SIZE': (504, 504) 
-#         },
-#         'FUSION': {
-#             'IMAGE_BEV_CHANNELS': 256, 
-#             'FUSED_CHANNELS': 512 
-#         },
-#         'MODEL': { 
-#             'NUM_CLASSES': 1 
-#         }
-#     })
-
-#     model = MultimodalDetectionNet(cfg_multimodal, num_queries=50, num_classes=cfg_multimodal.MODEL.NUM_CLASSES)
-    
-#     batch_size = 4 
-#     H_img_pc = 504 
-#     W_img_pc = 504 
-
-#     dummy_fused_input = torch.randn(batch_size, 6, H_img_pc, W_img_pc)
-    
-#     dummy_bbox3d_gt_corners = [
-#         torch.randn(2, 8, 3), 
-#         torch.randn(1, 8, 3), 
-#         torch.randn(0, 8, 3), 
-#         torch.randn(4, 8, 3)  
-#     ]
-    
-#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#     model.to(device)
-#     dummy_fused_input = dummy_fused_input.to(device)
-
-#     for i in range(len(dummy_bbox3d_gt_corners)):
-#         dummy_bbox3d_gt_corners[i] = dummy_bbox3d_gt_corners[i].to(device)
-    
-#     print(f"Running MultimodalDetectionNet on {device}...")
-    
-#     model.train() 
-#     outputs_train = model(dummy_fused_input, bbox3d=dummy_bbox3d_gt_corners)
-    
-#     print("\n--- MultimodalDetectionNet Training Output ---")
-#     print(f"Total Loss: {outputs_train['loss'].item()}")
-#     print(f"Predicted Boxes (8D Compat) Shape: {outputs_train['pred_boxes'].shape}")
-#     print(f"Detailed Losses: {outputs_train['losses']}")
-
-#     model.eval() 
-#     with torch.no_grad():
-#         predictions_final = model.predict(dummy_fused_input) 
-    
-#     print("\n--- MultimodalDetectionNet Inference Output (first batch item) ---")
-#     if predictions_final['preds']:
-#         print(f"Detected Boxes 8D Shape: {predictions_final['preds'][0].shape}")
-#         print(f"Example Detection (first box): {predictions_final['preds'][0][0] if predictions_final['preds'][0].shape[0] > 0 else 'N/A'}")
-#     else:
-#         print("No detections in first batch item after thresholding and mock NMS.")
