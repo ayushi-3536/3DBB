@@ -54,4 +54,18 @@ gdown https://drive.google.com/uc?id=1wMxWTpU1qUoY3DsCH31WJmvJxcjFXKlm -O checkp
 
 ```
 
+## Training using PointPillar with ResNet detection head
+
+```bash
+./launcher/dist_launch.sh train.py /home/as2114/code/3DBB/config/pointpillar.yaml 1
+
+```
+
+## Training using PointColoring with ResNet detection head
+
+```bash
+./launcher/dist_launch.sh train.py /home/as2114/code/3DBB/config/pointcoloring.yaml 1
+
+```
+
 
