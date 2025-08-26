@@ -112,3 +112,31 @@ def build_loader(config):
     logger.info(f"len dataloader val:   {len(data_loader_val)}")
 
     return dataset_train, data_loader_train, data_loader_val
+
+def build_inference_loader(config):
+    """
+    Build train/val datasets and dataloaders.
+    """
+    logger = get_logger()
+
+    # Parse train/val splits
+    _, val_df = parse_dataset(config.meta)
+    dataset_val = build_dataset(val_df)
+    logger.info(f"Successfully built val dataset: {len(dataset_val)} samples")
+
+    sampler_val = SequentialSampler(dataset_val)
+
+    # Val dataloader
+    data_loader_val = DataLoader(
+        dataset_val,
+        sampler=sampler_val,
+        batch_size=1,
+        num_workers=config.num_workers_val if hasattr(config, "num_workers_val") else 2,
+        pin_memory=True,
+        persistent_workers=True,
+        collate_fn=collate_fn
+    )
+
+    logger.info(f"len dataloader val:   {len(data_loader_val)}")
+
+    return dataset_val, data_loader_val
