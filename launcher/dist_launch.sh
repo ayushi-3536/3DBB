@@ -13,7 +13,7 @@ PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
 PYTHONPATH=$PYTHONPATH:/home/as2114/code/PANOPS/Depth-Anything-V2
 
 
-TORCH_DISTRIBUTED_DEBUG=INFO python -m torch.distributed.run --nproc_per_node=$GPUS --master_port=$((RANDOM + 10000)) \
+TORCH_DISTRIBUTED_DEBUG=INFO python -m torch.distributed.run --nproc_per_node=$GPUS --master_port=$((RANDOM + 1000)) \
      $SCRIPT --cfg $CONFIG ${@:4} 
 
 

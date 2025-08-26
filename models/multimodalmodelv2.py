@@ -10,6 +10,8 @@ from typing import Optional
 from pcdet.models.backbones_3d.vfe.pillar_vfe import PillarVFE
 from pcdet.models.backbones_2d.map_to_bev.pointpillar_scatter import PointPillarScatter
 from pcdet.models.backbones_2d.base_bev_backbone import BaseBEVBackbone
+from pcdet.ops.iou3d_nms.iou3d_nms_utils import boxes_iou3d_gpu
+from pcdet.ops.iou3d_nms import iou3d_nms_utils
 from .builder import MODELS
 from utils import get_logger
 
@@ -22,6 +24,7 @@ def corners_to_7d(corners):
     Returns:
         torch.Tensor: Shape (7,) containing (x,y,z,dx,dy,dz,yaw).
     """
+    
     center = corners.mean(dim=0) # (3,)
     min_coords = corners.min(dim=0).values
     max_coords = corners.max(dim=0).values
@@ -37,29 +40,18 @@ def corners_to_7d(corners):
 class Dinov2(nn.Module):
     def __init__(self):
         super(Dinov2, self).__init__()
-        
         try:
             self.dinomodel = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
             print("DINOv2 model loaded successfully.")
         except Exception as e:
             print(f"Error loading DINOv2 model: {e}")
-            print("Please ensure you have an internet connection. Falling back to dummy DINOv2 model.")
-            self.dinomodel = nn.Sequential(
-                nn.Conv2d(3, 768, kernel_size=14, stride=14),
-                nn.Flatten(2),
-                nn.Permute(0, 2, 1)
-            )
-            class MockDinoConfig:
-                patch_size = 14
-                embed_dim = 768
-            self.dinomodel.config = MockDinoConfig()
-
+        
         for param in self.dinomodel.parameters():
                 param.requires_grad = False
         print(f"DINOv2 model parameters frozen.")
 
-        self.output_feat_size = self.dinomodel.embed_dim 
-        dino_patch_size = self.dinomodel.patch_size 
+        self.output_feat_size = self.dinomodel.embed_dim # 768 for vitb14
+        dino_patch_size = self.dinomodel.patch_size # 14 for vitb14
         
         # Images must be resized to this resolution before input to DINOv2
         self.dino_input_H = 504 
@@ -181,11 +173,48 @@ class ImageToBEVProjector(nn.Module):
             align_corners=False
         )
         return x
+    
+
+class DetectionHead(nn.Module):
+    def __init__(self, fused_channels, num_queries, num_classes):
+        super().__init__()
+        self.num_queries = num_queries
+        self.num_classes = num_classes
+
+        # Shared linear layer
+        self.shared_fc = nn.Sequential(
+            nn.Linear(fused_channels, 256),
+            nn.ReLU(True)
+        )
+
+        # Separate heads
+        self.box_xyz_yaw = nn.Linear(256, num_queries * 4)      # x, y, z, yaw
+        self.box_dims = nn.Linear(256, num_queries * 3)         # dx, dy, dz
+        self.cls_head = nn.Linear(256, num_queries * (num_classes + 1)) # classes + confidence
+
+    def forward(self, fused_features):
+        batch_size = fused_features.size(0)
+        shared = self.shared_fc(fused_features)
+
+        # Predict unconstrained xyz+yaw
+        box_xyz_yaw = self.box_xyz_yaw(shared).view(batch_size, self.num_queries, 4)
+
+        # Predict dimensions and enforce positivity
+        box_dims = F.softplus(self.box_dims(shared)).view(batch_size, self.num_queries, 3)
+
+        # Class predictions
+        cls_pred = self.cls_head(shared).view(batch_size, self.num_queries, self.num_classes + 1)
+
+        # Concatenate box outputs: [x, y, z, dx, dy, dz, yaw]
+        box_pred = torch.cat([box_xyz_yaw[:, :, :3], box_dims, box_xyz_yaw[:, :, 3:4]], dim=-1)
+
+
+        return box_pred, cls_pred
 
 # --- Multimodal Fusion Detection Network ---
 @MODELS.register_module() 
 class MultimodalDetectionNet_v2(nn.Module):
-    def __init__(self, cfg, num_queries=50, num_classes=1): 
+    def __init__(self, cfg, num_queries=100, num_classes=1): 
         super().__init__()
         #do omegaconf
         
@@ -210,8 +239,8 @@ class MultimodalDetectionNet_v2(nn.Module):
         # --- Image Feature Extractor (DINOv2) ---
         self.dino_model = Dinov2() 
         self.image_to_bev_projector = ImageToBEVProjector(
-            image_input_channels=self.dino_model.output_feat_size, 
-            bev_output_channels=cfg.FUSION.IMAGE_BEV_CHANNELS, 
+            image_input_channels=self.dino_model.output_feat_size, # 768 for vitb14
+            bev_output_channels=cfg.FUSION.IMAGE_BEV_CHANNELS,
             target_H_bev=final_fused_H_bev, # Align image features to PC extractor's *final* output size
             target_W_bev=final_fused_W_bev, # Align image features to PC extractor's *final* output size
             image_patch_grid_size=self.dino_model.patch_grid_shape
@@ -225,30 +254,25 @@ class MultimodalDetectionNet_v2(nn.Module):
         self.logger.info(f"DEBUG_INIT: cfg.FUSION.FUSED_CHANNELS (output channels of first conv) = {cfg.FUSION.FUSED_CHANNELS}")
 
         self.fusion_convs = nn.Sequential(
+            nn.BatchNorm2d(fused_input_channels_bev),
             nn.Conv2d(fused_input_channels_bev, cfg.FUSION.FUSED_CHANNELS, kernel_size=3, padding=1),
-            nn.BatchNorm2d(cfg.FUSION.FUSED_CHANNELS),
             nn.ReLU(True),
-            nn.Conv2d(cfg.FUSION.FUSED_CHANNELS, cfg.FUSION.FUSED_CHANNELS, kernel_size=3, padding=1),
             nn.BatchNorm2d(cfg.FUSION.FUSED_CHANNELS),
+            nn.Conv2d(cfg.FUSION.FUSED_CHANNELS, cfg.FUSION.FUSED_CHANNELS, kernel_size=3, padding=1),
             nn.ReLU(True),
         )
-        # Explicit print after fusion_convs is defined
-        self.logger.info(f"DEBUG_INIT: self.fusion_convs[0].in_channels = {self.fusion_convs[0].in_channels}")
         
         # --- Query-Based 3D Detection Head ---
-        self.prediction_head = nn.Sequential(
-            nn.Linear(cfg.FUSION.FUSED_CHANNELS, 256), 
-            nn.ReLU(True),
-            nn.Linear(256, self.num_queries * (7 + self.num_classes + 1)) 
-        )
+        self.prediction_head = DetectionHead(cfg.FUSION.FUSED_CHANNELS, num_queries, num_classes)
 
         # Loss weights and cost weights for Hungarian matching
         self.loss_weights = {
-            'reg_l1': 10.0, 'yaw_l1': 1.0, 'cls_pos': 1.0, 'cls_neg': 1.0
+            'reg_l1': 1.0, 'yaw_l1': 1.0, 'cls_pos': 1.0, 'cls_neg': 1.0
         }
         self.cost_cls_weight = 1.0
-        self.cost_box_weight = 1.0
-        self.cost_yaw_weight = 0.1 
+        self.cost_box_weight =5.0
+        self.cost_iou_weight = 5.0
+        self.yaw_weight = 2.0
 
     def _prepare_pc_batch_dict(self, pc_bev_dense, batch_size):
         """
@@ -296,232 +320,226 @@ class MultimodalDetectionNet_v2(nn.Module):
 
     def forward(self, fused_input, bbox3d=None):
         """
-        Performs a forward pass through the multimodal 3D detection network.
+        Forward pass for multimodal 3D detection with IoU-based Hungarian matching.
 
         Args:
-            fused_input (torch.Tensor): Combined input (B, 6, H, W) where channels 0-2 are RGB
-                                        and channels 3-5 are projected point cloud (x,y,z).
-            bbox3d (list of torch.Tensor, optional): Ground truth 3D bounding boxes.
-                                  Each tensor in the list is (num_gt_objects, 8, 3) for one batch item.
-                                  If None, performs inference only.
+            fused_input (torch.Tensor): (B, 6, H, W) input where channels 0-2 are RGB and 3-5 are projected point cloud.
+            bbox3d (list of torch.Tensor, optional): GT boxes per sample in (N,8,3) or (N,7) format.
         
         Returns:
-            dict: Dictionary containing predicted boxes and, during training, the computed losses.
+            dict: Predicted boxes and, if training, computed losses.
         """
-        B, C_fused, H_orig, W_orig = fused_input.shape
+        fused_input = fused_input.cuda()
         device = fused_input.device
+        B, C_fused, H_orig, W_orig = fused_input.shape
 
+        # Split RGB and point cloud channels
         rgb_image = fused_input[:, :3, :, :]
-        pc_projected_raw = fused_input[:, 3:, :, :]  
+        pc_projected_raw = fused_input[:, 3:, :, :]
+        
+        
 
-        # 1. Image Feature Extraction (DINOv2)
-        if rgb_image.shape[2] != self.dino_model.dino_input_H or rgb_image.shape[3] != self.dino_model.dino_input_W:
-            rgb_image_resized = F.interpolate(rgb_image, 
-                                        size=(self.dino_model.dino_input_H, self.dino_model.dino_input_W), 
-                                        mode='bilinear', align_corners=False)
-        else:
-            rgb_image_resized = rgb_image
-            
-        dino_features_2d = self.dino_model(rgb_image_resized.cuda(), train=self.training)
-        self.logger.debug(f"DINOv2 Features Shape: {dino_features_2d.shape}")
+        # 1) Image features (DINOv2)
+        dino_features_2d = self.dino_model(rgb_image, train=self.training)
 
-        # 2. Point Cloud Feature Extraction (PointPillarBEVExtractor)
-        pc_bev_H_initial = self.pc_extractor.grid_size[1] # H of initial BEV grid (e.g., 496)
-        pc_bev_W_initial = self.pc_extractor.grid_size[0] # W of initial BEV grid (e.g., 432)
-
-        if pc_projected_raw.shape[2] != pc_bev_H_initial or pc_projected_raw.shape[3] != pc_bev_W_initial:
-            pc_projected_resized = F.interpolate(pc_projected_raw, 
-                                                size=(pc_bev_H_initial, pc_bev_W_initial), 
+        # 2) Point cloud BEV features
+        pc_bev_H, pc_bev_W = self.pc_extractor.grid_size[1], self.pc_extractor.grid_size[0]
+        if pc_projected_raw.shape[2:] != (pc_bev_H, pc_bev_W):
+            pc_projected_resized = F.interpolate(pc_projected_raw, size=(pc_bev_H, pc_bev_W),
                                                 mode='bilinear', align_corners=False)
         else:
             pc_projected_resized = pc_projected_raw
 
-        pc_batch_dict_for_extractor = self._prepare_pc_batch_dict(pc_projected_resized, B)
-        pc_bev_features = self.pc_extractor(pc_batch_dict_for_extractor)
-        self.logger.debug(f"PC BEV Features Shape: {pc_bev_features.shape}") 
+        pc_batch_dict = self._prepare_pc_batch_dict(pc_projected_resized, B)
+        pc_bev_features = self.pc_extractor(pc_batch_dict)
 
-        # 3. Project Image Features to BEV Space (Learned Alignment)
+        # 3) Project image features to BEV
         image_bev_features = self.image_to_bev_projector(dino_features_2d)
-        self.logger.debug(f"Image BEV Features Shape: {image_bev_features.shape}") 
 
-        # 4. Multimodal Fusion - Now shapes should match
+        # 4) Fusion
         fused_features_bev = torch.cat([pc_bev_features, image_bev_features], dim=1)
-        self.logger.debug(f"Fused Features Shape: {fused_features_bev.shape}")
         fused_features_bev = self.fusion_convs(fused_features_bev)
 
-        # 5. Global Pooling and Prediction Head
+        # 5) Global pooling + prediction head
         global_fused_features = F.adaptive_avg_pool2d(fused_features_bev, (1, 1)).view(B, -1)
-        
-        pred_raw = self.prediction_head(global_fused_features)
-        
-        pred_raw = pred_raw.view(B, self.num_queries, (7 + self.num_classes + 1))
-        
-        pred_boxes_7d = pred_raw[:, :, :7] 
-        pred_logits   = pred_raw[:, :, 7:] 
+        pred_boxes_7d, pred_logits = self.prediction_head(global_fused_features)
+        pred_boxes_compat = torch.cat([pred_boxes_7d, pred_logits[:, :, 0:1]], dim=-1)
 
-        pred_boxes_compat = torch.cat([pred_boxes_7d, pred_logits[:, :, 0:1]], dim=-1) 
+        # # Reshape predictions: [B, Q, 7 + num_classes + 1]
+        # pred_raw = pred_raw.view(B, self.num_queries, 7 + self.num_classes + 1)
+        
+        # pred_boxes_7d = pred_raw[:, :, :7]
+        # pred_logits = pred_raw[:, :, 7:]
+        # pred_boxes_compat = torch.cat([pred_boxes_7d, pred_logits[:, :, 0:1]], dim=-1)
 
-        # --- Loss Calculation (ONLY if bbox3d is provided) ---
-        if bbox3d is None: 
-            return {'pred_boxes': pred_boxes_compat} 
+        # Inference-only
+        if bbox3d is None:
+            return {'pred_boxes': pred_boxes_compat}
 
-        # Convert GT corners to 7D format for all batch items (if not already done)
+        # ---- Convert GT to 7D format ----
         gt_7d_boxes_list = []
-        for gt_data_per_sample in bbox3d: # bbox3d is a list of (N_i, 8, 3) or (N_i, 7) tensors
-            gt_data_per_sample = gt_data_per_sample.to(device) # Ensure GT is on device
-            
-            if gt_data_per_sample.shape[0] == 0:
-                gt_7d_boxes_list.append(torch.empty((0, 7), dtype=gt_data_per_sample.dtype, device=device))
-            # Check if it's already in (N, 7) format
-            elif gt_data_per_sample.ndim == 2 and gt_data_per_sample.shape[1] == 7:
-                self.logger.debug(f"GT already in 7D format. Shape: {gt_data_per_sample.shape}")
-                gt_7d_boxes_list.append(gt_data_per_sample)
-            # Assume it's in (N, 8, 3) corners format, then convert
-            elif gt_data_per_sample.ndim == 3 and gt_data_per_sample.shape[1] == 8 and gt_data_per_sample.shape[2] == 3:
-                self.logger.debug(f"Converting {gt_data_per_sample.shape} GT corners to 7D format.")
-                # Apply _convert_corners_to_7d to each object's 8 corners and stack
-                converted_7d_boxes = torch.stack([self.corners_to_7d(obj_corners) for obj_corners in gt_data_per_sample])
-                gt_7d_boxes_list.append(converted_7d_boxes)
-            else:
-                raise ValueError(f"Unexpected GT bounding box format. Expected (N, 8, 3) or (N, 7), got {gt_data_per_sample.shape}")
+        for gt_data_per_sample in bbox3d:
+            gt_data_per_sample = gt_data_per_sample.to(device)
+            gt_7d_boxes_list.append(gt_data_per_sample)
+            #assert that dimensions are positive
+            if (gt_7d_boxes_list[-1][:, 3:6] <0).any():
+                print(f"Error: GT boxes have negative dimensions: {gt_7d_boxes_list[-1]}")
+                raise ValueError("GT boxes have non-positive dimensions.")
 
-        losses = {
-            'total_loss': torch.tensor(0.0, device=device), 'reg_l1': torch.tensor(0.0, device=device),
-            'yaw_l1': torch.tensor(0.0, device=device), 'cls_pos': torch.tensor(0.0, device=device),
-            'cls_neg': torch.tensor(0.0, device=device),
-        }
-        
+        # ---- Initialize losses ----
+        losses = {k: torch.tensor(0.0, device=device) for k in
+                ['total_loss', 'reg_l1', 'yaw_l1', 'cls_pos', 'cls_neg', '3diouloss']}
+        matched_info = [{} for _ in range(B)] # To store matched boxes and scores per sample
+
+        # ---- Per-sample Hungarian matching & loss ----
         for b in range(B):
-            pred_boxes_sample = pred_boxes_7d[b] 
-            pred_logits_sample = pred_logits[b] 
-            
-            self.logger.debug(f"DEBUG: Sample {b} - pred_boxes_sample shape: {pred_boxes_sample.shape}, pred_logits_sample shape: {pred_logits_sample.shape}")
-            
-            # Get the ALREADY converted 7D GT boxes for the current sample
-            gt_boxes_sample = gt_7d_boxes_list[b] # This is now (N_gt_objects_sample, 7)
-            self.logger.debug(f"DEBUG: Sample {b} - gt_boxes_sample shape: {gt_boxes_sample.shape}")
-            
-            # Define gt_labels_sample for the current batch item
-            gt_labels_sample = torch.zeros(gt_boxes_sample.shape[0], dtype=torch.long, device=pred_logits_sample.device)
+            pred_boxes_sample = pred_boxes_7d[b]  # (Q,7)
+            pred_logits_sample = pred_logits[b]   # (Q,C+1)
+            gt_boxes_sample = gt_7d_boxes_list[b] # (G,7)
 
-            num_gt = gt_boxes_sample.shape[0]
-            num_preds = self.num_queries
+            num_gt, num_preds = gt_boxes_sample.shape[0], self.num_queries
+            gt_labels_sample = torch.zeros(num_gt, dtype=torch.long, device=device)
 
+            # No GT case
             if num_gt == 0:
-                target_cls_for_loss = torch.full((num_preds,), self.num_classes, dtype=torch.long, device=pred_logits_sample.device)
-                cls_loss = F.cross_entropy(pred_logits_sample, target_cls_for_loss)
+                target_noobj = torch.full((num_preds,), self.num_classes, dtype=torch.long, device=device)
+                cls_loss = F.cross_entropy(pred_logits_sample, target_noobj)
                 losses['cls_neg'] += self.loss_weights['cls_neg'] * cls_loss
                 losses['total_loss'] += self.loss_weights['cls_neg'] * cls_loss
                 continue
-            
-            cost_cls = F.cross_entropy(pred_logits_sample.repeat(num_gt, 1, 1).flatten(0,1), 
-                                    gt_labels_sample.repeat_interleave(num_preds), reduction='none').view(num_gt, num_preds)
-            
-            gt_boxes_sample = gt_boxes_sample.to(pred_boxes_sample.device) # Ensure GT boxes are on the same device
-            cost_box = torch.cdist(pred_boxes_sample[:, :6], gt_boxes_sample[:, :6], p=1)
-            # Transpose cost_box to match (num_gt, num_preds) format for element-wise addition
-            cost_box = cost_box.transpose(0, 1) # Now (num_gt, num_preds)
 
-            pred_yaw = pred_boxes_sample[:, 6]
-            gt_yaw = gt_boxes_sample[:, 6]
-            
-            pred_yaw_expanded = pred_yaw.unsqueeze(0).repeat(num_gt, 1) 
-            gt_yaw_expanded = gt_yaw.unsqueeze(1).repeat(1, num_preds)   
-            
-            diff_yaw = torch.abs(pred_yaw_expanded - gt_yaw_expanded)
-            cost_yaw = torch.min(diff_yaw, 2 * np.pi - diff_yaw) 
+            # --- Compute cost components ---
+            with torch.no_grad():
+                iou_matrix = boxes_iou3d_gpu(pred_boxes_sample, gt_boxes_sample)  # (Q, G)
 
-            cost_matrix = self.cost_cls_weight * cost_cls + \
-                          self.cost_box_weight * cost_box + \
-                          self.cost_yaw_weight * cost_yaw
-            
-            row_ind, col_ind = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
-            
-            row_ind = torch.from_numpy(row_ind).long().to(pred_logits_sample.device)
-            col_ind = torch.from_numpy(col_ind).long().to(pred_logits_sample.device)
+                # Regression L1 cost (center + size)
+                reg_cost = (
+                    F.l1_loss(pred_boxes_sample[:, None, 0:3], gt_boxes_sample[None, :, 0:3], reduction='none').sum(-1) +
+                    F.l1_loss(pred_boxes_sample[:, None, 3:6], gt_boxes_sample[None, :, 3:6], reduction='none').sum(-1)
+                )  # (Q, G)
 
-            cls_loss_matched = F.cross_entropy(pred_logits_sample[col_ind], gt_labels_sample[row_ind])
-            # Separate regression loss for box parameters (x,y,z,dx,dy,dz) and yaw
-            reg_loss_matched = F.smooth_l1_loss(
-                pred_boxes_sample[col_ind][:, :6], # Only x,y,z,dx,dy,dz
-                gt_boxes_sample[row_ind][:, :6],
-                reduction='mean'
-            )
-            yaw_loss_matched = F.smooth_l1_loss(
-                pred_boxes_sample[col_ind][:, 6], # Only yaw
-                gt_boxes_sample[row_ind][:, 6],
-                reduction='mean'
-            )
-            
-            unmatched_preds_mask = torch.ones(num_preds, dtype=torch.bool, device=pred_logits_sample.device)
-            unmatched_preds_mask[col_ind] = False 
+                # Classification cost
+                cls_prob = pred_logits_sample.softmax(-1)  # (Q, C+1)
+                cls_cost = -cls_prob[:, 0:1].expand(-1, num_gt)  # 1-class case, class 0 is object
+                
+                
 
-            if unmatched_preds_mask.sum() > 0:
+                # IoU cost
+                iou_cost = 1 - iou_matrix  # higher IoU → lower cost
+                
+                #Yaw cost, take into account angle periodicity
+                pred_vec = torch.stack([torch.cos(pred_boxes_sample[:, 6]), torch.sin(pred_boxes_sample[:, 6])], dim=-1)  # (Q, 2)
+                yaw_cost = 1 - torch.abs(torch.matmul(pred_vec, torch.stack([torch.cos(gt_boxes_sample[:, 6]), torch.sin(gt_boxes_sample[:, 6])], dim=-1).t()))  # (Q, G)
+
+                # Total cost
+                cost_matrix = (
+                    self.cost_cls_weight * cls_cost +
+                    self.cost_box_weight * reg_cost +
+                    self.cost_iou_weight * iou_cost +
+                    self.yaw_weight * yaw_cost
+                    
+                ).cpu().numpy()
+
+            # Hungarian assignment
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            row_ind = torch.as_tensor(row_ind, device=device, dtype=torch.long)  # predictions
+            col_ind = torch.as_tensor(col_ind, device=device, dtype=torch.long)  # GTs
+
+            # --- Matched classification loss ---
+            cls_loss_matched = F.cross_entropy(pred_logits_sample[row_ind], gt_labels_sample[col_ind])
+
+            # --- Unmatched predictions classification loss ---
+            unmatched_mask = torch.ones(num_preds, dtype=torch.bool, device=device)
+            unmatched_mask[row_ind] = False
+            if unmatched_mask.any():
                 cls_loss_unmatched = F.cross_entropy(
-                    pred_logits_sample[unmatched_preds_mask], 
-                    torch.full((unmatched_preds_mask.sum(),), self.num_classes, dtype=torch.long, device=pred_logits_sample.device)
+                    pred_logits_sample[unmatched_mask],
+                    torch.full((unmatched_mask.sum(),), self.num_classes, device=device, dtype=torch.long)
                 )
             else:
-                cls_loss_unmatched = torch.tensor(0.0, device=pred_logits_sample.device)
-            
-            cls_loss_sample = cls_loss_matched + cls_loss_unmatched
+                cls_loss_unmatched = torch.tensor(0.0, device=device)
 
-            losses['reg_l1'] += reg_loss_matched.to(device)
-            losses['yaw_l1'] += yaw_loss_matched.to(device) # Ensure yaw loss is accumulated
-            losses['cls_pos'] += cls_loss_matched.to(device)
-            losses['cls_neg'] += cls_loss_unmatched.to(device)
+            # --- Regression losses ---
+            matched_pred = pred_boxes_sample[row_ind]
+            matched_gt = gt_boxes_sample[col_ind]
             
-            sample_total_loss = (
+            matched_info[b] = {
+                'pred_boxes': matched_pred,
+                'gt_boxes': matched_gt,
+                'scores': pred_logits_sample[row_ind].softmax(-1)[:,0]
+            }
+
+
+            reg_centers = F.l1_loss(matched_pred[:, 0:3], matched_gt[:, 0:3], reduction='mean')
+            reg_sizes = F.l1_loss(matched_pred[:, 3:6], matched_gt[:, 3:6], reduction='mean')
+            reg_loss_matched = reg_centers + reg_sizes
+
+            # --- Yaw loss ---
+            pred_vec = torch.stack([torch.cos(matched_pred[:, 6]), torch.sin(matched_pred[:, 6])], dim=-1)
+            gt_vec = torch.stack([torch.cos(matched_gt[:, 6]), torch.sin(matched_gt[:, 6])], dim=-1)
+            yaw_loss_matched = F.l1_loss(pred_vec, gt_vec, reduction='mean')
+
+            # --- IoU loss ---
+            iou_loss = 1 - boxes_iou3d_gpu(matched_pred, matched_gt).diagonal().mean()
+
+            # --- Aggregate ---
+            losses['reg_l1'] += reg_loss_matched
+            losses['yaw_l1'] += yaw_loss_matched
+            losses['cls_pos'] += cls_loss_matched
+            losses['cls_neg'] += cls_loss_unmatched
+            losses['3diouloss'] += iou_loss
+            losses['total_loss'] += (
                 self.loss_weights['reg_l1'] * reg_loss_matched +
-                self.loss_weights['yaw_l1'] * yaw_loss_matched + # Use the actual yaw loss here
+                self.loss_weights['yaw_l1'] * yaw_loss_matched +
                 self.loss_weights['cls_pos'] * cls_loss_matched +
-                self.loss_weights['cls_neg'] * cls_loss_unmatched
+                self.loss_weights['cls_neg'] * cls_loss_unmatched +
+                self.loss_weights.get('iou', 1.0) * iou_loss
             )
-            losses['total_loss'] += sample_total_loss.to(device)
 
 
+        # Average over batch
         for k in losses:
-            losses[k] /= B
+            losses[k] = losses[k] / B
 
-        return {'loss': losses['total_loss'], 'pred_boxes': pred_boxes_compat, 'losses': losses}
+        return {'loss': losses['total_loss'], 'pred_boxes': pred_boxes_compat, 'losses': losses, 'matched_info': matched_info}
 
-    @torch.no_grad()
-    def predict(self, fused_inputs, conf_thresh=0.5, iou_thresh=0.5):
-        self.eval() 
+    # @torch.no_grad()
+    # def predict(self, fused_inputs, conf_thresh=0.5, iou_thresh=0.5):
+    #     self.eval() 
 
-        outputs = self.forward(fused_inputs, bbox3d=None) 
+    #     outputs = self.forward(fused_inputs, bbox3d=None) 
         
-        pred_boxes_compat = outputs['pred_boxes'] 
+    #     pred_boxes_compat = outputs['pred_boxes'] 
 
-        results = {'preds': []}
+    #     results = {'preds': []}
 
-        for b in range(pred_boxes_compat.shape[0]):
-            boxes_8d_sample = pred_boxes_compat[b]  
+    #     for b in range(pred_boxes_compat.shape[0]):
+    #         boxes_8d_sample = pred_boxes_compat[b]  
             
-            centers = boxes_8d_sample[:, :3]
-            dims    = boxes_8d_sample[:, 3:6]
-            yaw     = boxes_8d_sample[:, 6]
-            scores  = torch.sigmoid(boxes_8d_sample[:, 7])  
+    #         centers = boxes_8d_sample[:, :3]
+    #         dims    = boxes_8d_sample[:, 3:6]
+    #         yaw     = boxes_8d_sample[:, 6]
+    #         scores  = torch.sigmoid(boxes_8d_sample[:, 7])  
 
-            keep = scores > conf_thresh
-            if keep.sum() == 0:
-                results['preds'].append(torch.empty((0, 8), device=boxes_8d_sample.device))
-                continue
+    #         keep = scores > conf_thresh
+    #         if keep.sum() == 0:
+    #             results['preds'].append(torch.empty((0, 8), device=boxes_8d_sample.device))
+    #             continue
             
-            xy_boxes = torch.cat([
-                centers[keep, :2] - dims[keep, :2] / 2,
-                centers[keep, :2] + dims[keep, :2] / 2
-            ], dim=-1)  
+    #         xy_boxes = torch.cat([
+    #             centers[keep, :2] - dims[keep, :2] / 2,
+    #             centers[keep, :2] + dims[keep, :2] / 2
+    #         ], dim=-1)  
 
-            try:
-                keep_idx = torch.ops.torchvision.nms(xy_boxes, scores[keep], iou_thresh)
-            except AttributeError:
-                print("Warning: torch.ops.torchvision.nms not found. Using simple top-K sort instead of NMS.")
-                sorted_scores, sort_indices = torch.sort(scores[keep], descending=True)
-                keep_idx = sort_indices[:min(10, len(sort_indices))] 
+    #         try:
+    #             keep_idx = torch.ops.torchvision.nms(xy_boxes, scores[keep], iou_thresh)
+    #         except AttributeError:
+    #             print("Warning: torch.ops.torchvision.nms not found. Using simple top-K sort instead of NMS.")
+    #             sorted_scores, sort_indices = torch.sort(scores[keep], descending=True)
+    #             keep_idx = sort_indices[:min(10, len(sort_indices))] 
 
-            final_boxes = boxes_8d_sample[keep][keep_idx]
+    #         final_boxes = boxes_8d_sample[keep][keep_idx]
 
-            results['preds'].append(final_boxes)
+    #         results['preds'].append(final_boxes)
 
-        return results
+    #     return results

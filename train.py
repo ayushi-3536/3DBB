@@ -8,7 +8,7 @@ from mmcv.runner import init_dist
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from utils import (get_config, get_dist_info, get_logger, build_optimizer, build_scheduler,
-                save_checkpoint, set_random_seed, compute_ap3d_r11, box7_to_corners, corners_to_7d)
+                save_checkpoint, set_random_seed, compute_ap3d_r11, box7_to_corners, corners_to_7d, average_precision_3d)
 from datasets import build_loader
 from models import build_model
 import datetime
@@ -19,7 +19,8 @@ from timm.utils import AverageMeter
 from sklearn.metrics import r2_score
 import math
 import warnings
-
+from matplotlib import patches
+import matplotlib.pyplot as plt
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 import numpy as np
@@ -36,7 +37,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=0, help='random seed for initialization')
 
     parser.add_argument(
-        '--output', default="/mnt/gsdata/projects/panops/plant_trait_net/outputs_v5/13dbb_fusednet", type=str, help='root of output folder, '
+        '--output', default="/mnt/gsdata/projects/panops/plant_trait_net/outputs_v5/3dbbv2_withpointpillar200", type=str, help='root of output folder, '
         'the full path is <output>/<model_name>/<tag>')
     parser.add_argument('--tag', type=str, help='tag of experiment')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
@@ -105,7 +106,6 @@ def train_one_epoch(config, model, data_loader, optimizer, epoch, lr_scheduler):
         for key, value_tensor in losses_dict.items():
             if key in all_loss_meters: # Only update meters that we defined
                 all_loss_meters[key].update(value_tensor.item())
-            logger.info(f'Loss {key}: {value_tensor.item():.4f}')
             
         loss.backward()
         
@@ -237,7 +237,57 @@ def train(cfg):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
     dist.barrier()
-    
+
+
+def plot_bev_boxes(preds, gts, scores, title="BEV", save_path=None, bev_shape=(504, 50)):
+    """
+    preds: (N,7) array of predicted boxes [x,y,z,dx,dy,dz,yaw]
+    gts: (M,7) array of GT boxes
+    scores: (N,) prediction scores
+    bev_shape: (H, W) size of BEV grid for axis scaling
+    """
+    W, H = bev_shape[1], bev_shape[0]  # width, height
+    fig, ax = plt.subplots(figsize=(12, 3))  # wider for landscape
+
+    def draw_box(box, color, linestyle="-"):
+        x, y, dx, dy, yaw = box[0], box[1], box[3], box[4], box[6]
+        corners = np.array([
+            [dx/2, dy/2],
+            [dx/2, -dy/2],
+            [-dx/2, -dy/2],
+            [-dx/2, dy/2]
+        ])
+        # rotate
+        rot = np.array([
+            [np.cos(yaw), -np.sin(yaw)],
+            [np.sin(yaw),  np.cos(yaw)]
+        ])
+        corners = corners @ rot.T + np.array([x, y])
+        poly = patches.Polygon(corners, fill=False, edgecolor=color, linestyle=linestyle, linewidth=2)
+        ax.add_patch(poly)
+
+    # Draw GTs
+    for gt in gts:
+        draw_box(gt, "green", linestyle="--")
+
+    # Draw Predictions
+    for pred, score in zip(preds, scores):
+        if score > 0.5:
+            draw_box(pred, "red", linestyle="-")
+
+    ax.set_title(title)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_aspect("equal")
+    ax.set_xlim(-W/2, W/2)
+    ax.set_ylim(-H/2, H/2)
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+
 def validate(config, data_loader, model):
     logger = get_logger()
     model.eval()
@@ -247,9 +297,11 @@ def validate(config, data_loader, model):
     yaw_l1_meter = AverageMeter()
     cls_pos_meter = AverageMeter()
     cls_neg_meter = AverageMeter()
+    iou3d_meter = AverageMeter()
     
     all_loss_meters = {
         'total_loss': loss_meter,
+        '3diouloss': iou3d_meter,
         'reg_l1': reg_l1_meter,
         'yaw_l1': yaw_l1_meter,
         'cls_pos': cls_pos_meter,
@@ -257,13 +309,8 @@ def validate(config, data_loader, model):
     }
 
     all_preds, all_gts = [], []
-
-    # Get the normalization stats from the dataset
-    dataset_instance = data_loader.dataset
-    
+    all_aps = []
     device = next(model.parameters()).device
-    bbox_mean = dataset_instance.bbox_mean.to(device)
-    bbox_std = dataset_instance.bbox_std.to(device)
 
     with torch.no_grad():
         for idx, samples in enumerate(data_loader):
@@ -272,71 +319,165 @@ def validate(config, data_loader, model):
                 samples[key] = value.to(device)
             
             outputs = model(**samples)
+
+            # --- Process each sample in the batch ---
+            batch_preds = outputs['pred_boxes']  # [B, num_queries, 8]
+            batch_gt_boxes = samples['bbox3d']   # list of GT tensors
+            batch_matched = outputs.get('matched_info', None)  # Optional matched indices
             
+            for b in range(batch_preds.shape[0]):
+                if batch_matched is not None:
+                    pred_current = batch_matched[b]['pred_boxes']
+                    scores = batch_matched[b]['scores']
+                    #print min max scores
+                    logger.info(f'Sample {b} - Prediction scores range: min {scores.min().item():.4f}, max {scores.max().item():.4f}')
+                    scores = torch.sigmoid(scores)
+                    #after sigmoid
+                    logger.info(f'Sample {b} - Prediction scores after sigmoid range: min {scores.min().item():.4f}, max {scores.max().item():.4f}')
+                else:
+                    pred_current = batch_preds[b]  # (num_queries, 8)
+                    # Prediction scores and thresholding
+                    scores = torch.sigmoid(pred_current[:, 7])
+                    
+                if idx < 5:
+                    #call plot_bev_boxes
+                    plot_bev_boxes(pred_current[:, :7].cpu().numpy(), 
+                                   batch_gt_boxes[b][:, :7].cpu().numpy(), 
+                                   scores.cpu().numpy(), 
+                                   title=f"Sample {b} - Validation", 
+                                   save_path=f"bev_sample_{idx}_batch_{b}.png")
+                    
+                #SIZE OF MATCHED PRED
+                logger.info(f'Sample {b} - Number of matched predictions: {pred_current.shape[0]}')
+                
+                gt_current = batch_gt_boxes[b]  # (num_gt, 7)
+
+                # Filter out zero-padded GTs
+                non_padded_indices = (gt_current[:, :7].abs().sum(dim=1) != 0)
+                gt_boxes_sample = gt_current[non_padded_indices] if non_padded_indices.any() else torch.empty((0,7), device=device)
+
+                
+                keep = scores > 0.0  # keep all for AP ranking
+                pred_boxes_sample = pred_current[keep, :7]
+                pred_scores_sample = scores[keep]
+                
+                #log range of scores
+                logger.info(f'Sample {b} scores range: min {pred_scores_sample.min().item():.4f}, max {pred_scores_sample.max().item():.4f}')
+                logger.info(f'Sample {b} - Number of predictions after thresholding: {pred_boxes_sample.shape[0]}')
+                logger.info(f'Sample {b} - Number of GT boxes: {gt_boxes_sample.shape[0]}')
+                
+
+                # Compute per-sample binary 3D AP
+                if len(pred_boxes_sample) == 0 or len(gt_boxes_sample) == 0:
+                    ap_sample = 0.0
+                else:
+                    ap_sample = average_precision_3d(pred_boxes_sample, pred_scores_sample, gt_boxes_sample, iou_threshold=0.1)
+                all_aps.append(ap_sample)
+
+                # Store predictions and GTs for logging or further metrics
+                all_preds.append(pred_current[keep].cpu().numpy())
+                all_gts.append(gt_boxes_sample.cpu().numpy())
+                
+            # --- Update loss meters ---
             losses_dict = outputs['losses']
             for key, value_tensor in losses_dict.items():
                 if key in all_loss_meters:
                     all_loss_meters[key].update(value_tensor.item())
             
-            # --- Un-normalize the predictions ---
-            # batch_preds has shape [B, num_queries, 8]
-            batch_preds = outputs['pred_boxes'] 
-            batch_preds_unnorm = batch_preds.clone()
-            batch_preds_unnorm[:, :, :7] = batch_preds_unnorm[:, :, :7] * bbox_std + bbox_mean
-
-            # --- Un-normalize the ground truths ---
-            # batch_gts is a single tensor from the DataLoader, shape [B, N_max, 7]
-            batch_gts_unnorm = samples['bbox3d'].clone()
-            batch_gts_unnorm[:, :, :7] = batch_gts_unnorm[:, :, :7] * bbox_std + bbox_mean
-
-            # --- Process each sample in the batch ---
-            for b in range(batch_preds_unnorm.shape[0]):
-                # Process predictions for the current sample
-                pred_current_unnorm = batch_preds_unnorm[b]
-                scores = torch.sigmoid(pred_current_unnorm[:, 7])
-                
-                keep = scores > 0.5
-                if keep.sum() == 0:
-                    final_preds_np = np.empty((0, 8), dtype=np.float32)
-                else:
-                    centers = pred_current_unnorm[keep, :3]
-                    dims = pred_current_unnorm[keep, 3:6]
-                    xy_boxes = torch.cat([centers[:, :2] - dims[:, :2] / 2,
-                                        centers[:, :2] + dims[:, :2] / 2], dim=-1)
-                    keep_idx = torch.ops.torchvision.nms(xy_boxes, scores[keep], 0.7)
-                    final_preds_np = pred_current_unnorm[keep][keep_idx].cpu().numpy()
-
-                all_preds.append(final_preds_np)
-
-                # Process ground truths for the current sample
-                gt_current_unnorm = batch_gts_unnorm[b]
-
-                if gt_current_unnorm.shape[0] > 0:
-                    # Filter out padded rows (all zeros)
-                    non_padded_indices = (gt_current_unnorm[:, :7].abs().sum(dim=1) != 0)
-                    gt_current_unpadded = gt_current_unnorm[non_padded_indices]
-                    
-                    if gt_current_unpadded.numel() > 0:
-                        # Convert un-normalized 7-params to 8-corners (Numpy)
-                        gt_corners_list = [box7_to_corners(box.cpu().numpy()) for box in gt_current_unpadded]
-                        gt_corners_np = np.array(gt_corners_list)
-                    else:
-                        gt_corners_np = np.empty((0, 8, 3), dtype=np.float32)
-                else:
-                    gt_corners_np = np.empty((0, 8, 3), dtype=np.float32)
-
-                all_gts.append(gt_corners_np)
-            
             if idx % config.print_freq == 0:
                 logger.info(f'Val: [{idx}/{len(data_loader)}] '
                             f'loss {all_loss_meters["total_loss"].val:.4f} ({all_loss_meters["total_loss"].avg:.4f})')
 
-    # Compute AP3D|R11
-    ap3d_r11 = compute_ap3d_r11(all_preds, all_gts, iou_thresh=0.7)
-    
-    logger.info(f"=> Loss {all_loss_meters['total_loss'].avg:.4f}, AP3D|R11 {ap3d_r11:.4f}")
+    # Compute mean AP over all samples
+    mean_ap = sum(all_aps) / len(all_aps) if all_aps else 0.0
+    logger.info(f"=> Loss {all_loss_meters['total_loss'].avg:.4f}, Binary 3D AP {mean_ap:.4f}")
 
-    return all_loss_meters['total_loss'].avg, ap3d_r11, all_loss_meters
+    return all_loss_meters['total_loss'].avg, mean_ap, all_loss_meters
+
+    
+# def validate(config, data_loader, model):
+#     logger = get_logger()
+#     model.eval()
+    
+#     loss_meter = AverageMeter()
+#     reg_l1_meter = AverageMeter()
+#     yaw_l1_meter = AverageMeter()
+#     cls_pos_meter = AverageMeter()
+#     cls_neg_meter = AverageMeter()
+#     iou3d_meter = AverageMeter()
+    
+#     all_loss_meters = {
+#         'total_loss': loss_meter,
+#         '3diou': iou3d_meter,
+#         'reg_l1': reg_l1_meter,
+#         'yaw_l1': yaw_l1_meter,
+#         'cls_pos': cls_pos_meter,
+#         'cls_neg': cls_neg_meter,
+#     }
+
+#     all_preds, all_gts = [], []
+#     device = next(model.parameters()).device
+
+#     with torch.no_grad():
+#         for idx, samples in enumerate(data_loader):
+#             # Move all inputs to the correct device
+#             for key, value in samples.items():
+#                 samples[key] = value.to(device)
+            
+#             outputs = model(**samples)
+#             aps = []
+
+#             for b, pred_boxes in enumerate(outputs['preds']):
+#                 if len(pred_boxes) == 0:
+#                     aps.append(0.0)
+#                     continue
+#                 scores = torch.sigmoid(pred_boxes[:, 7])  # object confidence
+#                 gt_boxes_sample = gt_7d_boxes_list[b]     # your GT boxes for this sample
+#                 ap = average_precision_3d(pred_boxes[:, :7], scores, gt_boxes_sample, iou_threshold=0.5)
+#                 aps.append(ap)
+
+#             mean_ap = sum(aps) / len(aps)
+#             print("Binary 3D AP:", mean_ap)
+            
+#             losses_dict = outputs['losses']
+#             for key, value_tensor in losses_dict.items():
+#                 if key in all_loss_meters:
+#                     all_loss_meters[key].update(value_tensor.item())
+            
+#             # --- Un-normalize the predictions ---
+#             # batch_preds has shape [B, num_queries, 8]
+#             batch_preds = outputs['pred_boxes'] 
+
+
+#             # --- Process each sample in the batch ---
+#             for b in range(batch_preds.shape[0]):
+#                 # Predictions
+#                 pred_current = batch_preds[b]
+#                 print("pred_current before sigmoid:", pred_current.shape, pred_current)
+#                 scores = torch.sigmoid(pred_current[:, 7])
+#                 keep = scores > 0.5
+#                 if keep.sum() == 0:
+#                     final_preds_np_7 = np.empty((0, 8), dtype=np.float32)
+#                 else:
+#                     final_preds_np_7 = pred_current[keep, :8].cpu().numpy()
+#                 all_preds.append(final_preds_np_7)
+
+#                 # Ground truths
+#                 gt_current = samples['bbox3d'][b]
+#                 non_padded_indices = (gt_current[:, :7].abs().sum(dim=1) != 0)
+#                 gt_current_np = gt_current[non_padded_indices, :7].cpu().numpy() if non_padded_indices.any() else np.empty((0,7), dtype=np.float32)
+#                 all_gts.append(gt_current_np)
+                
+#             if idx % config.print_freq == 0:
+#                 logger.info(f'Val: [{idx}/{len(data_loader)}] '
+#                             f'loss {all_loss_meters["total_loss"].val:.4f} ({all_loss_meters["total_loss"].avg:.4f})')
+
+#     # Compute AP3D|R11
+#     ap3d_r11 = compute_ap3d_r11(all_preds, all_gts, iou_thresh=0.5)
+    
+#     logger.info(f"=> Loss {all_loss_meters['total_loss'].avg:.4f}, AP3D|R11 {ap3d_r11:.4f}")
+
+#     return all_loss_meters['total_loss'].avg, ap3d_r11, all_loss_meters
 
 if __name__ == '__main__':
     # Parse arguments

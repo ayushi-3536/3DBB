@@ -101,7 +101,7 @@ def build_loader(config):
     data_loader_val = DataLoader(
         dataset_val,
         sampler=sampler_val,
-        batch_size=config.batch_size,
+        batch_size=1,
         num_workers=config.num_workers_val if hasattr(config, "num_workers_val") else 2,
         pin_memory=True,
         persistent_workers=True,

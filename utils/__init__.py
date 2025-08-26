@@ -9,10 +9,10 @@ from .configutils import load_class_from_config
 from .classfactory import instantiate_object
 from .misc import ListAverageMeter
 from .distributed_utils import get_dist_info, set_random_seed
-from .metrics import compute_ap3d_r11, box7_to_corners, corners_to_7d
+from .metrics import compute_ap3d_r11, box7_to_corners, corners_to_7d, average_precision_3d
 
 
-__all__ = ['get_config', 'get_logger', 'compute_ap3d_r11', 'box7_to_corners', 'corners_to_7d', 'get_dist_info', 'set_random_seed', 'build_scheduler',
+__all__ = ['get_config', 'get_logger', 'compute_ap3d_r11', 'average_precision_3d', 'box7_to_corners', 'corners_to_7d', 'get_dist_info', 'set_random_seed', 'build_scheduler',
         'build_optimizer', 'parse_losses', 'get_grad_norm',
         'auto_resume_helper', 'load_checkpoint', 'save_checkpoint',
         'reduce_tensor', 'custom_transformer',

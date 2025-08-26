@@ -154,7 +154,7 @@ class PointPillarBEVExtractor(nn.Module):
         # The true BEV features will be `batch_dict['spatial_features_2d']`
         self.dummy_detection_head = nn.Linear(backbone_2d_cfg.NUM_FILTERS[-1], 10) 
 
-    def forward(self, pointclouds):
+    def forward(self, pointclouds, only_return_bev=True):
         """
         Processes point cloud data through the PointPillars encoding stages
         to generate BEV features.
@@ -195,11 +195,6 @@ class PointPillarBEVExtractor(nn.Module):
         for k, v in batch_dict.items():
             print(f"{k}: {v.shape if isinstance(v, torch.Tensor) else v}")
         bev_features = batch_dict['spatial_features_2d']
-        
-        # Dummy head for demonstration (you would integrate bev_features into your multimodal model)
-        # This part just ensures the script runs and produces an output.
-        # For your fusion model, you would take `bev_features` directly.
-        #out = self.dummy_detection_head(bev_features.mean(dim=[2,3])) # Global average pool for dummy
         
         return bev_features # Return the actual BEV features
 

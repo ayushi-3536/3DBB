@@ -6,7 +6,9 @@ from PIL import Image
 import numpy as np
 from torchvision import transforms
 import torch.nn.functional as F
+import torch.nn as nn
 from utils import corners_to_7d, get_logger
+
 
 class PointCloudDataset(Dataset):
     def __init__(self, dataframe, transform=None, pc_transform=None, size=(504, 504)):
@@ -30,10 +32,7 @@ class PointCloudDataset(Dataset):
             self.transform = transform
         
         if pc_transform is None:
-            self.pc_transform = transforms.Normalize(
-                mean=self.pc_mean,
-                std=self.pc_std
-            )
+            self.pc_transform = nn.Identity()
         else:
             self.pc_transform = pc_transform
 
@@ -67,15 +66,13 @@ class PointCloudDataset(Dataset):
 
         if not temp_bboxes_7:
             # Return an empty tensor of the correct shape if no boxes
-            bbox3d_normalized = torch.empty((0, 7), dtype=torch.float32)
+            bbox3d = torch.empty((0, 7), dtype=torch.float32)
         else:
             # Stack the list of tensors into a single tensor
-            bbox3d_normalized = torch.stack(temp_bboxes_7)
+            bbox3d = torch.stack(temp_bboxes_7)
             
-            # Normalize the bounding boxes
-            bbox3d_normalized = (bbox3d_normalized - self.bbox_mean) / self.bbox_std
         
         return {
             'fused_input': fused_input,
-            'bbox3d': bbox3d_normalized
+            'bbox3d': bbox3d
         }
