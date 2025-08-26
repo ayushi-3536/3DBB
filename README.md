@@ -36,7 +36,7 @@ pip install -r requirements.txt
 Follow the official instructions here:
 # https://github.com/open-mmlab/OpenPCDet/blob/master/docs/INSTALL.md
 ```
-## Checkpoint for PointPiller
+## Checkpoint for PointPillar
 mkdir -p checkpoint
 pip install gdown
 gdown https://drive.google.com/uc?id=1wMxWTpU1qUoY3DsCH31WJmvJxcjFXKlm -O checkpoint/pointpillar_gdrive.pth
@@ -51,6 +51,20 @@ gdown https://drive.google.com/uc?id=1wMxWTpU1qUoY3DsCH31WJmvJxcjFXKlm -O checkp
 
 ```bash
 ./launcher/dist_launch.sh train.py /home/as2114/code/3DBB/config/pc.yaml 1
+
+```
+
+## Training using PointPillar with a single ResNet-like detection head
+
+```bash
+./launcher/dist_launch.sh train.py /home/as2114/code/3DBB/config/pointpillar.yaml 1
+
+```
+
+## Training using PointPainting with a single ResNet-like detection head
+
+```bash
+./launcher/dist_launch.sh train.py /home/as2114/code/3DBB/config/pointcoloring.yaml 1
 
 ```
 
