@@ -58,6 +58,7 @@ train:
 evaluate:
   eval_freq: 3
   save_best: true
+  eval_only: true
 
 checkpoint:
   auto_resume: true

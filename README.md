@@ -47,12 +47,6 @@ gdown https://drive.google.com/uc?id=1wMxWTpU1qUoY3DsCH31WJmvJxcjFXKlm -O checkp
 
 ../data_preprocessing/create_train_val_split.ipynb
 
-## Training
-
-```bash
-./launcher/dist_launch.sh train.py /home/as2114/code/3DBB/config/pc.yaml 1
-
-```
 
 ## Training using PointPillar with a single ResNet-like detection head
 
@@ -67,5 +61,9 @@ gdown https://drive.google.com/uc?id=1wMxWTpU1qUoY3DsCH31WJmvJxcjFXKlm -O checkp
 ./launcher/dist_launch.sh train.py /home/as2114/code/3DBB/config/pointcoloring.yaml 1
 
 ```
+## Inference
+```bash
+ python inference.py --cfg /home/as2114/code/3DBB/config/pointpillar.yaml --resume checkpoint.pth
 
+```
 
