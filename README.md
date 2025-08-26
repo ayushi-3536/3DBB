@@ -36,7 +36,7 @@ pip install -r requirements.txt
 Follow the official instructions here:
 # https://github.com/open-mmlab/OpenPCDet/blob/master/docs/INSTALL.md
 ```
-## Checkpoint for PointPiller
+## Checkpoint for PointPillar
 mkdir -p checkpoint
 pip install gdown
 gdown https://drive.google.com/uc?id=1wMxWTpU1qUoY3DsCH31WJmvJxcjFXKlm -O checkpoint/pointpillar_gdrive.pth
